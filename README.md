@@ -302,5 +302,5 @@ MIT — see [LICENSE](LICENSE).
 
 ## Author
 
-AgentChan was developed as part of the Hermes Agent project by Nous Research, with
-contributions from real multi-agent ML training experiments.
+AgentChan was developed by Abdelrhman Rayis as part of the Hermes Agent project by
+Nous Research, with contributions from real multi-agent ML training experiments.
