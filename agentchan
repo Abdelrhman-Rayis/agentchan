@@ -1,0 +1,381 @@
+#!/usr/bin/env python3
+"""agentchan - inter-agent communication over a shared filesystem + tmux.
+
+Design goals (for large-scale, multi-agent coordination):
+  * Durable  : every message is a distinct file, never overwritten -> full history.
+  * Safe     : delivery is atomic (write to tmp, then os.rename into the inbox),
+               so concurrent senders can never tear a message. Reads *claim* a
+               message by atomic rename (new/ -> cur/), so no double-processing.
+  * Addressed: every message has from / to (or "*" broadcast) + a correlation id.
+  * Observable: a presence registry + human-readable JSON any person can inspect.
+  * Notified : on send we nudge the recipient's tmux pane so nobody polls blindly.
+
+Layout ($AGENT_CHANNEL_DIR, default /tmp/agent-channel):
+  registry/<name>.json          presence: name, pane, pid, started, last_seen, status
+  <name>/new/                   delivered-but-unread messages (maildir "new")
+  <name>/cur/                   read/processed messages       (maildir "cur")
+  <name>/tmp/                   staging for atomic delivery
+  broadcast/                    copy of every broadcast, for audit
+
+Message filename: <epoch_ns>-<from>-<shortid>.json  (lexical sort == chronological)
+"""
+import argparse, glob, json, os, socket, subprocess, sys, tempfile, time, uuid
+from datetime import datetime, timezone
+
+ROOT = os.environ.get("AGENT_CHANNEL_DIR", "/tmp/agent-channel")
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def me(explicit=None):
+    return explicit or os.environ.get("AGENT_NAME") or socket.gethostname().split(".")[0]
+
+
+def mailbox(name):
+    return os.path.join(ROOT, name)
+
+
+def ensure_mailbox(name):
+    for sub in ("new", "cur", "tmp"):
+        os.makedirs(os.path.join(mailbox(name), sub), exist_ok=True)
+    os.makedirs(os.path.join(ROOT, "registry"), exist_ok=True)
+    os.makedirs(os.path.join(ROOT, "broadcast"), exist_ok=True)
+
+
+def atomic_write(path, data: str):
+    d = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.rename(tmp, path)  # atomic on the same filesystem
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+# ---------------------------------------------------------------- registry ----
+def reg_path(name):
+    return os.path.join(ROOT, "registry", f"{name}.json")
+
+
+def register(name, pane, status="online"):
+    ensure_mailbox(name)
+    rec = {
+        "name": name,
+        "pane": pane or os.environ.get("TMUX_PANE", ""),
+        "pid": os.getpid(),
+        "started": now_iso(),
+        "last_seen": now_iso(),
+        "status": status,
+    }
+    if os.path.exists(reg_path(name)):
+        try:
+            old = json.load(open(reg_path(name)))
+            rec["started"] = old.get("started", rec["started"])
+        except Exception:
+            pass
+    atomic_write(reg_path(name), json.dumps(rec, indent=2))
+    return rec
+
+
+def touch(name):
+    if not os.path.exists(reg_path(name)):
+        return
+    try:
+        rec = json.load(open(reg_path(name)))
+    except Exception:
+        return
+    rec["last_seen"] = now_iso()
+    atomic_write(reg_path(name), json.dumps(rec, indent=2))
+
+
+def load_registry():
+    out = {}
+    for p in glob.glob(os.path.join(ROOT, "registry", "*.json")):
+        try:
+            r = json.load(open(p))
+            out[r["name"]] = r
+        except Exception:
+            pass
+    return out
+
+
+# ------------------------------------------------------------------ nudge ----
+def nudge(pane, text):
+    if not pane:
+        return False
+    try:
+        subprocess.run(["tmux", "send-keys", "-t", pane, text, "Enter"],
+                       check=True, capture_output=True)
+        return True
+    except Exception:
+        return False
+
+
+# ------------------------------------------------------------------- send ----
+def deliver(to_name, msg, do_nudge=True):
+    ensure_mailbox(to_name)
+    fname = f"{time.time_ns()}-{msg['from']}-{msg['id']}.json"
+    box = mailbox(to_name)
+    staging = os.path.join(box, "tmp", fname)
+    atomic_write(staging, json.dumps(msg, indent=2))
+    os.rename(staging, os.path.join(box, "new", fname))  # atomic publish
+    if do_nudge:
+        reg = load_registry().get(to_name, {})
+        preview = (msg.get("subject") or msg.get("body", "")).replace("\n", " ").strip()
+        if len(preview) > 90:
+            preview = preview[:90] + "..."
+        nudge(reg.get("pane"),
+              f"[agentchan] {msg['type']} from {msg['from']} #{msg['id']}: "
+              f"{preview}  (agentchan read to reply)")
+
+
+def cmd_send(a):
+    frm = me(a.frm)
+    body = a.body
+    if body is None and not sys.stdin.isatty():
+        body = sys.stdin.read()
+    body = body or ""
+    meta = json.loads(a.meta) if a.meta else {}
+    msg = {
+        "id": uuid.uuid4().hex[:8],
+        "ts": now_iso(),
+        "from": frm,
+        "to": a.to,
+        "type": a.type,
+        "re": a.re,
+        "subject": a.subject or "",
+        "body": body,
+        "meta": meta,
+    }
+    touch(frm)
+    reg = load_registry()
+    if a.to == "*":
+        recipients = [n for n in reg if n != frm]
+        atomic_write(os.path.join(ROOT, "broadcast",
+                     f"{time.time_ns()}-{frm}-{msg['id']}.json"),
+                     json.dumps(msg, indent=2))
+    else:
+        recipients = [a.to]
+    if not recipients:
+        print("(no recipients registered)")
+    for r in recipients:
+        deliver(r, dict(msg, to=r), do_nudge=not a.no_nudge)
+    log_transcript(msg)
+    # Echo the full message so it is visible in the sender's own pane too.
+    print("\n>>> SENT " + "-" * 50)
+    print(render(msg))
+    print("-" * 59)
+
+
+# ------------------------------------------------------------------- read ----
+def list_new(name):
+    return sorted(glob.glob(os.path.join(mailbox(name), "new", "*.json")))
+
+
+def log_transcript(msg):
+    """Append one human-readable line-block to a single shared chat.log.
+    Small O_APPEND writes are atomic on POSIX, so concurrent agents stay ordered."""
+    hdr = f"[{msg['ts']}] {msg['from']} -> {msg['to']} ({msg['type']}) #{msg['id']}"
+    if msg.get("re"):
+        hdr += f" re:{msg['re']}"
+    if msg.get("subject"):
+        hdr += f" | {msg['subject']}"
+    body = "    " + msg.get("body", "").replace("\n", "\n    ")
+    try:
+        with open(os.path.join(ROOT, "chat.log"), "a") as f:
+            f.write(hdr + "\n" + body + "\n\n")
+    except Exception:
+        pass
+
+
+def render(msg, path=None):
+    hdr = f"[{msg['ts']}] {msg['from']} -> {msg['to']}  #{msg['id']}  ({msg['type']})"
+    if msg.get("re"):
+        hdr += f"  re:{msg['re']}"
+    lines = [hdr]
+    if msg.get("subject"):
+        lines.append(f"  subject: {msg['subject']}")
+    lines.append("  " + msg.get("body", "").replace("\n", "\n  "))
+    if msg.get("meta"):
+        lines.append("  meta: " + json.dumps(msg["meta"]))
+    return "\n".join(lines)
+
+
+def cmd_inbox(a):
+    name = me(a.name)
+    touch(name)
+    files = list_new(name)
+    if a.json:
+        print(json.dumps([json.load(open(f)) for f in files], indent=2))
+        return
+    if not files:
+        print(f"({name}: inbox empty)")
+        return
+    print(f"{name}: {len(files)} unread")
+    for f in files:
+        m = json.load(open(f))
+        sub = f" - {m['subject']}" if m.get("subject") else ""
+        print(f"  #{m['id']} [{m['type']}] from {m['from']}{sub}")
+
+
+def cmd_read(a):
+    name = me(a.name)
+    touch(name)
+    files = list_new(name)
+    if a.id:
+        files = [f for f in files if f"-{a.id}.json" in f]
+    elif not a.all:
+        files = files[:1]  # oldest unread
+    if not files:
+        print(f"({name}: nothing to read)")
+        return
+    for f in files:
+        m = json.load(open(f))
+        print(render(m))
+        print("-" * 60)
+        if not a.peek:  # claim it: atomic move new -> cur
+            os.rename(f, os.path.join(mailbox(name), "cur", os.path.basename(f)))
+
+
+def cmd_history(a):
+    name = me(a.name)
+    msgs = []
+    boxes = [name] if not a.all_agents else [
+        os.path.basename(d) for d in glob.glob(os.path.join(ROOT, "*"))
+        if os.path.isdir(d) and os.path.basename(d) not in ("registry", "broadcast")]
+    for b in boxes:
+        for sub in ("cur", "new"):
+            for f in glob.glob(os.path.join(mailbox(b), sub, "*.json")):
+                try:
+                    msgs.append((os.path.basename(f), json.load(open(f))))
+                except Exception:
+                    pass
+    msgs.sort(key=lambda x: x[0])
+    seen = set()
+    for _, m in msgs:
+        if m["id"] in seen:
+            continue
+        seen.add(m["id"])
+        if a.with_ and a.with_ not in (m["from"], m["to"]):
+            continue
+        print(render(m))
+        print("-" * 60)
+
+
+def cmd_who(a):
+    reg = load_registry()
+    if not reg:
+        print("(no agents registered)")
+        return
+    now = datetime.now(timezone.utc)
+    for n, r in sorted(reg.items()):
+        try:
+            age = int((now - datetime.fromisoformat(r["last_seen"])).total_seconds())
+        except Exception:
+            age = -1
+        unread = len(list_new(n))
+        print(f"  {n:12} pane={r.get('pane',''):5} "
+              f"status={r.get('status','')} last_seen={age}s ago unread={unread}")
+
+
+def cmd_register(a):
+    r = register(me(a.name), a.pane, a.status)
+    print(f"registered {r['name']} (pane {r['pane']}, pid {r['pid']})")
+
+
+def cmd_watch(a):
+    name = me(a.name)
+    ensure_mailbox(name)
+    print(f"watching {name}/new ... (Ctrl-C to stop)")
+    while True:
+        touch(name)
+        files = list_new(name)
+        if files:
+            for f in files:
+                print(render(json.load(open(f))))
+                print("-" * 60)
+                if not a.peek:
+                    os.rename(f, os.path.join(mailbox(name), "cur", os.path.basename(f)))
+            if a.once:
+                return
+        time.sleep(a.interval)
+
+
+def cmd_await(a):
+    """Block until the inbox has at least one message, then exit WITHOUT claiming.
+    Meant to be run in the background so the harness re-invokes the agent on arrival;
+    the agent then reads/handles the message in the foreground."""
+    name = me(a.name)
+    ensure_mailbox(name)
+    while True:
+        touch(name)
+        files = list_new(name)
+        if files:
+            m = json.load(open(files[0]))
+            print(f"{len(files)} unread; first: #{m['id']} [{m['type']}] "
+                  f"from {m['from']}: {m.get('subject') or ''}")
+            return
+        time.sleep(a.interval)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="agentchan", description="inter-agent comms")
+    p.add_argument("--root", help="channel dir (or $AGENT_CHANNEL_DIR)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("register", help="announce presence")
+    s.add_argument("--name"); s.add_argument("--pane"); s.add_argument("--status", default="online")
+    s.set_defaults(func=cmd_register)
+
+    s = sub.add_parser("who", help="list agents")
+    s.set_defaults(func=cmd_who)
+
+    s = sub.add_parser("send", help="send a message")
+    s.add_argument("--to", required=True, help='recipient name or "*" for broadcast')
+    s.add_argument("--type", default="msg",
+                   help="msg|task|reply|ack|status|query|result|error|greeting")
+    s.add_argument("--subject"); s.add_argument("--re", help="correlation id")
+    s.add_argument("--from", dest="frm", help="override sender name")
+    s.add_argument("--meta", help="JSON string of structured payload")
+    s.add_argument("--no-nudge", action="store_true")
+    s.add_argument("body", nargs="?", help="message body (or pipe via stdin)")
+    s.set_defaults(func=cmd_send)
+
+    s = sub.add_parser("inbox", help="list unread")
+    s.add_argument("--name"); s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_inbox)
+
+    s = sub.add_parser("read", help="read + claim unread (oldest by default)")
+    s.add_argument("--name"); s.add_argument("--id"); s.add_argument("--all", action="store_true")
+    s.add_argument("--peek", action="store_true", help="do not mark as read")
+    s.set_defaults(func=cmd_read)
+
+    s = sub.add_parser("history", help="full conversation log")
+    s.add_argument("--name"); s.add_argument("--with", dest="with_")
+    s.add_argument("--all-agents", action="store_true")
+    s.set_defaults(func=cmd_history)
+
+    s = sub.add_parser("watch", help="block until messages arrive")
+    s.add_argument("--name"); s.add_argument("--interval", type=float, default=2.0)
+    s.add_argument("--once", action="store_true"); s.add_argument("--peek", action="store_true")
+    s.set_defaults(func=cmd_watch)
+
+    s = sub.add_parser("await", help="block until inbox non-empty, exit without claiming")
+    s.add_argument("--name"); s.add_argument("--interval", type=float, default=3.0)
+    s.set_defaults(func=cmd_await)
+
+    a = p.parse_args()
+    global ROOT
+    if a.root:
+        ROOT = a.root
+    a.func(a)
+
+
+if __name__ == "__main__":
+    main()
