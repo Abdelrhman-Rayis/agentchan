@@ -1,4 +1,4 @@
-# I Got Tired of Watching Two AI Agents Stare Past Each Other, So I Built a Mailbox
+# Let Your AI Agents Talk to Each Other in Minutes
 
 I had two terminals open. Claude Code was in one, planning a machine learning
 experiment. Hermes was in the other, ready to run it. And they had absolutely no way
